@@ -1,1 +1,4 @@
 # FindBack
+Campus lost-and-found processes are often informal, relying on WhatsApp groups, notice boards, or word of mouth. As a result, lost items are difficult to track, found items may not reach their owners, and there is no systematic way to determine whether a reported lost item matches a found item.
+The proposed system will provide a centralized campus platform where students and staff can report lost or found items with details such as category, description, location, time, and images. The backend will automatically identify and rank potential matches using factors such as item category, location, time, and description similarity. The system will also provide a structured claim and verification process to ensure that items are returned to their legitimate owners.
+The project aims to improve the efficiency, accuracy, and transparency of the campus lost-and-found process while maintaining a reliable record of reports, matches, claims, and item handovers.
