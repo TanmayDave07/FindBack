@@ -8,9 +8,237 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
+// ENUMS
+
+enum UserRole {
+  STUDENT
+  ADMIN
+}
+
+enum ItemType {
+  LOST
+  FOUND
+}
+
+enum ReportStatus {
+  ACTIVE
+  MATCHED
+  RESOLVED
+  CLOSED
+}
+
+enum MatchStatus {
+  PENDING
+  CONFIRMED
+  DISMISSED
+}
+
+enum ClaimStatus {
+  PENDING
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+  COMPLETED
+}
+
+enum VerificationStatus {
+  PENDING
+  VERIFIED
+  FAILED
+}
+
+// ==========================================
+// USER
+// ==========================================
+
 model User {
-  id        String   @id @default(uuid())
-  email     String   @unique
-  name      String?
+  id            String   @id @default(uuid())
+  name          String
+  email         String   @unique
+  passwordHash  String
+  role          UserRole @default(STUDENT)
+  emailVerified Boolean  @default(false)
+
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  reports ItemReport[]
+  claims  Claim[]
+
+  verificationsGiven Verification[] @relation("VerificationReviewer")
+
+  handoversGiven    Handover[] @relation("HandoverSender")
+  handoversReceived Handover[] @relation("HandoverReceiver")
+}
+
+// ==========================================
+// CATEGORY
+// ==========================================
+
+model Category {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  createdAt DateTime @default(now())
+
+  reports ItemReport[]
+}
+
+// ==========================================
+// LOCATION
+// ==========================================
+
+model Location {
+  id          String  @id @default(uuid())
+  name        String  @unique
+  description String?
+
+  reports ItemReport[]
+}
+
+// ==========================================
+// ITEM REPORT
+// ==========================================
+
+model ItemReport {
+  id String @id @default(uuid())
+
+  userId     String
+  categoryId String
+  locationId String
+
+  // Additional details
+  categoryDetails String?
+  locationDetails String? // Floor, room number, nearby landmark
+
+  type        ItemType
+  title       String
+  description String
+  color       String?
+  eventDate   DateTime
+  imageUrl    String?
+
+  status ReportStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Restrict)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Restrict)
+
+  lostMatches  Match[] @relation("LostReportMatches")
+  foundMatches Match[] @relation("FoundReportMatches")
+
+  claims Claim[]
+
+  @@index([type, status])
+  @@index([categoryId, type])
+  @@index([locationId, type])
+  @@index([eventDate])
+  @@index([userId, createdAt])
+}
+
+// ==========================================
+// MATCH
+// ==========================================
+
+model Match {
+  id String @id @default(uuid())
+
+  lostReportId  String
+  foundReportId String
+
+  score  Float
+  status MatchStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  lostReport ItemReport @relation("LostReportMatches", fields: [lostReportId], references: [id], onDelete: Cascade)
+
+  foundReport ItemReport @relation("FoundReportMatches", fields: [foundReportId], references: [id], onDelete: Cascade)
+
+  claims Claim[]
+
+  @@unique([lostReportId, foundReportId])
+  @@index([lostReportId, score])
+  @@index([foundReportId])
+}
+
+// ==========================================
+// CLAIM
+// ==========================================
+
+model Claim {
+  id String @id @default(uuid())
+
+  userId        String
+  foundReportId String
+  matchId       String?
+
+  message String
+  status  ClaimStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  foundReport ItemReport @relation(fields: [foundReportId], references: [id], onDelete: Restrict)
+
+  match Match? @relation(fields: [matchId], references: [id], onDelete: SetNull)
+
+  verifications Verification[]
+  handover      Handover?
+
+  @@index([foundReportId, status])
+  @@index([userId])
+}
+
+// ==========================================
+// VERIFICATION
+// ==========================================
+
+model Verification {
+  id String @id @default(uuid())
+
+  claimId      String
+  verifiedById String?
+
+  question            String
+  expectedAnswerHash  String
+  submittedAnswerHash String?
+
+  status VerificationStatus @default(PENDING)
+
+  verifiedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  claim Claim @relation(fields: [claimId], references: [id], onDelete: Cascade)
+
+  verifiedBy User? @relation("VerificationReviewer", fields: [verifiedById], references: [id], onDelete: SetNull)
+
+  @@index([claimId])
+}
+
+// ==========================================
+// HANDOVER
+// ==========================================
+
+model Handover {
+  id String @id @default(uuid())
+
+  claimId String @unique
+
+  handedOverById String
+  receivedById   String
+
+  handedOverAt DateTime @default(now())
+  notes        String?
+
+  claim Claim @relation(fields: [claimId], references: [id], onDelete: Restrict)
+
+  handedOverBy User @relation("HandoverSender", fields: [handedOverById], references: [id], onDelete: Restrict)
+
+  receivedBy User @relation("HandoverReceiver", fields: [receivedById], references: [id], onDelete: Restrict)
 }
