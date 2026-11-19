@@ -99,50 +99,141 @@ Admins use the same login endpoint as students.
 | GET | `/api/reports/:id` | Logged-in user |
 | POST | `/api/reports` | Logged-in user |
 | PATCH | `/api/reports/:id` | Report owner or admin |
+| POST | `/api/reports/:id/close` | Report owner or admin |
 | DELETE | `/api/reports/:id` | Report owner or admin |
 | GET | `/api/admin/users` | Admin only |
 
-Students can change their own report details. Only admins can set report status.
+Students can change and close their own reports. Admins can change any report
+and set any report status.
 A student requesting an admin route receives `403 Forbidden`. Requests without
 a valid token receive `401 Unauthorized`.
 
 ## Reports
 
-Get category and location IDs from `/api/categories` and `/api/locations`.
-Create a report with `POST /api/reports`:
+Create a lost report with `POST /api/reports`:
 
 ```json
 {
   "type": "LOST",
-  "title": "Lost blue wallet",
-  "description": "A blue wallet near the library.",
-  "categoryId": "REPLACE_WITH_CATEGORY_UUID",
-  "locationId": "REPLACE_WITH_LOCATION_UUID",
-  "eventDate": "2026-11-16T10:00:00Z",
-  "color": "Blue",
-  "locationDetails": "First floor"
+  "title": "Black wallet",
+  "category": "Wallet",
+  "color": "Black",
+  "location": "Library",
+  "date": "2026-11-10",
+  "description": "Black leather wallet"
 }
 ```
 
-Required fields: `type` (`LOST` or `FOUND`), `title`, `description`, `categoryId`,
-`locationId`, and `eventDate` (ISO date and time). Optional fields: `color`,
-`imageUrl` (HTTP/HTTPS URL), `categoryDetails`, and `locationDetails`.
-Send `null` to clear optional fields. The server sets `userId` from the account.
+Use `type: "FOUND"` for a found item. Both types share the same routes.
+Required fields are `type`, `title`, `description`, a category, a location,
+and the date the item was lost or found. Category and location names must already
+exist and are matched without case sensitivity. Get the available choices from
+`/api/categories` and `/api/locations`. The seed includes `Wallet` and `Library`.
 
-`PATCH` accepts only fields being changed. Admins may also set `status` to
+The previous format still works: use `categoryId` instead of `category`,
+`locationId` instead of `location`, and `eventDate` instead of `date`.
+Send one form of each field. `date` accepts `YYYY-MM-DD` and is stored at midnight
+UTC. Use `eventDate`, such as `2026-11-10T14:30:00Z`, to record an exact time.
+
+Optional fields are `color`, `imageUrl` (HTTP/HTTPS URL), `categoryDetails`,
+`locationDetails` (floor, room, or nearby landmark), and `privateDetails`.
+Send `null` to clear optional fields. The server sets the owner from the logged-in
+account; callers cannot supply `userId`.
+
+For a found item, put serial numbers, wallet contents, personal information,
+or distinguishing marks used to prove ownership in `privateDetails`. Only the
+report owner and admins can read that field. It is omitted for other users,
+including in report lists, and is never used in keyword searches. Titles,
+descriptions, images, and location details are visible to other logged-in users,
+so keep identifying information out of those fields.
+
+`PATCH /api/reports/:id` accepts only fields being changed. Owners can change
+their report details and set `status` to `CLOSED`. Admins may set `status` to
 `ACTIVE`, `MATCHED`, `RESOLVED`, or `CLOSED`. A report linked to a claim cannot
 be deleted and returns `409 Conflict`.
+
+To close a report without deleting its history, send:
+
+```text
+POST /api/reports/REPORT_UUID/close
+```
+
+No request body is needed. The owner or an admin can close it. Closing an already
+closed report returns the same closed report.
 
 List reports with optional filters:
 
 ```text
-GET /api/reports?page=1&limit=20&type=LOST&status=ACTIVE
+GET /api/reports?type=LOST&status=ACTIVE&category=Wallet&location=Library&dateFrom=2026-11-10&dateTo=2026-11-12&q=black&page=1&limit=20
 ```
 
-`categoryId` and `locationId` filters are also supported. The default page size
-is 20 and the maximum is 100. The response is `{ "reports": [...], "page": 1,
-"limit": 20, "total": 42 }`. Creation returns `201`; deletion returns `204`
-with no body. Other successful requests return `200`.
+All filters are optional and can be combined:
+
+| Parameter | Meaning |
+| --- | --- |
+| `type` | `LOST` or `FOUND` |
+| `status` | `ACTIVE`, `MATCHED`, `RESOLVED`, or `CLOSED` |
+| `category` / `categoryId` | Category name or UUID; send one |
+| `location` / `locationId` | Location name or UUID; send one |
+| `dateFrom` / `dateTo` | First and last date, in `YYYY-MM-DD`; either can be used alone |
+| `q` | Text found in title, description, color, category name, or location name |
+| `page` / `limit` | Page number and number of reports per page |
+
+Name filters match exact names without case sensitivity. Keyword search matches
+part of the public text without case sensitivity. Date filters use the event
+date and include the whole first and last day in UTC. Invalid dates, reversed
+ranges, repeated parameters, and unknown parameters return `400`.
+
+The default page size is 20 and the maximum is 100. Results are ordered newest
+first, with the report ID used to keep the order stable when times are equal.
+The response is `{ "reports": [...], "page": 1, "limit": 20, "total": 42 }`;
+`total` counts all matching reports before pagination. Category, location, and
+owner name are included. Creation returns `201`; deletion returns `204` with no
+body. Other successful requests return `200`.
+
+### SQL used for search
+
+The listing controller uses ordinary SQL: `JOIN` connects reports to their
+category, location, and owner; `WHERE` applies filters; `ILIKE` searches text;
+`ORDER BY`, `LIMIT`, and `OFFSET` handle ordering and pages. Prisma sends input
+as separate SQL parameters, so entered text is never executed as SQL.
+
+For example, a simplified query for the first page of lost wallets is:
+
+```sql
+SELECT r."id", r."title", c."name" AS category, l."name" AS location
+FROM "ItemReport" r
+JOIN "Category" c ON r."categoryId" = c."id"
+JOIN "Location" l ON r."locationId" = l."id"
+WHERE r."type" = 'LOST'
+  AND r."status" = 'ACTIVE'
+  AND c."name" = 'Wallet'
+  AND r."description" ILIKE '%black%'
+ORDER BY r."createdAt" DESC, r."id" DESC
+LIMIT 20 OFFSET 0;
+```
+
+The existing database migrations already create simple indexes on type/status,
+category/type, location/type, event date, and owner/creation time. These help
+filter reports by those fields. Keyword matching checks text directly, which
+is sufficient for this MVP; no special search engine or advanced SQL is used.
+
+### Checking the reporting features
+
+The tests use Node's built-in test runner and a separate PostgreSQL database.
+They check both report types, ownership, closing, private details, filters,
+pagination, invalid inputs, and SQL-looking search text.
+
+Create a local test database, apply migrations to it, and run:
+
+```bash
+createdb findback_test
+DATABASE_URL="postgresql://localhost:5432/findback_test" DIRECT_URL="postgresql://localhost:5432/findback_test" npm run db:migrate
+TEST_DATABASE_URL="postgresql://localhost:5432/findback_test" npm test
+```
+
+Use your local PostgreSQL username/password in those URLs if required. The tests
+require `TEST_DATABASE_URL` and refuse a database that already contains reports.
 
 Errors have a simple format:
 

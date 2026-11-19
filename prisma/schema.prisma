@@ -113,6 +113,7 @@ model ItemReport {
   type        ItemType
   title       String
   description String
+  privateDetails String? // Identifying details visible only to the owner and admins
   color       String?
   eventDate   DateTime
   imageUrl    String?

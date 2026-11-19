@@ -2,7 +2,8 @@
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const reportFields = [
   "type", "title", "description", "categoryId", "locationId", "eventDate",
-  "color", "imageUrl", "categoryDetails", "locationDetails", "status",
+  "category", "location", "date", "color", "imageUrl", "categoryDetails",
+  "locationDetails", "privateDetails", "status",
 ];
 const reportStatuses = ["ACTIVE", "MATCHED", "RESOLVED", "CLOSED"];
 
@@ -34,6 +35,33 @@ function readString(body, field, maxLength) {
 function checkId(value, field) {
   if (typeof value !== "string" || !uuidPattern.test(value)) {
     const error = new Error(`${field} must be a valid UUID.`);
+    error.statusCode = 400;
+    throw error;
+  }
+}
+
+function readDate(value, field, dateOnly = false) {
+  const datePart = typeof value === "string" ? value.slice(0, 10) : "";
+  const day = new Date(`${datePart}T00:00:00.000Z`);
+  const validDay = /^\d{4}-\d{2}-\d{2}$/.test(datePart)
+    && !Number.isNaN(day.getTime())
+    && day.toISOString().slice(0, 10) === datePart;
+  const validFormat = typeof value === "string"
+    && (dateOnly ? value === datePart : /^\d{4}-\d{2}-\d{2}T/.test(value));
+  const date = new Date(dateOnly ? day : value);
+
+  if (!validDay || !validFormat || Number.isNaN(date.getTime())) {
+    const format = dateOnly ? "YYYY-MM-DD" : "ISO date and time";
+    const error = new Error(`${field} must be a valid ${format}.`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return date;
+}
+
+function checkConflictingFields(body, first, second) {
+  if (first in body && second in body) {
+    const error = new Error(`Send either ${first} or ${second}, not both.`);
     error.statusCode = 400;
     throw error;
   }
@@ -94,10 +122,14 @@ export function validateReport(req, res, next) {
     }
   }
 
-  for (const field of ["categoryId", "locationId"]) {
-    if (creating || field in body) {
-      checkId(body[field], field);
-      data[field] = body[field];
+  for (const field of ["category", "location"]) {
+    const idField = `${field}Id`;
+    checkConflictingFields(body, field, idField);
+    if (field in body) {
+      data[field] = readString(body, field, 100);
+    } else if (creating || idField in body) {
+      checkId(body[idField], idField);
+      data[idField] = body[idField];
     }
   }
 
@@ -110,25 +142,17 @@ export function validateReport(req, res, next) {
     data.type = body.type;
   }
 
-  if (creating || "eventDate" in body) {
-    if (typeof body.eventDate !== "string" || !/^\d{4}-\d{2}-\d{2}T/.test(body.eventDate)) {
-      const error = new Error("eventDate must be an ISO date, such as 2026-11-16T10:00:00Z.");
-      error.statusCode = 400;
-      throw error;
-    }
-    const date = new Date(body.eventDate);
-    if (Number.isNaN(date.getTime())) {
-      const error = new Error("eventDate must be a valid date.");
-      error.statusCode = 400;
-      throw error;
-    }
-    data.eventDate = date;
+  checkConflictingFields(body, "date", "eventDate");
+  if ("date" in body) {
+    data.eventDate = readDate(body.date, "date", true);
+  } else if (creating || "eventDate" in body) {
+    data.eventDate = readDate(body.eventDate, "eventDate");
   }
 
-  for (const field of ["color", "categoryDetails", "locationDetails", "imageUrl"]) {
+  for (const field of ["color", "categoryDetails", "locationDetails", "imageUrl", "privateDetails"]) {
     if (!(field in body)) continue;
     const value = body[field];
-    const maxLength = field === "imageUrl" ? 2048 : field === "color" ? 50 : 500;
+    const maxLength = field === "imageUrl" ? 2048 : field === "privateDetails" ? 5000 : field === "color" ? 50 : 500;
     if (value !== null && (typeof value !== "string" || value.trim().length > maxLength)) {
       const error = new Error(`${field} must be text of at most ${maxLength} characters, or null.`);
       error.statusCode = 400;
@@ -154,8 +178,8 @@ export function validateReport(req, res, next) {
   }
 
   if ("status" in body) {
-    if (req.user.role !== "ADMIN") {
-      const error = new Error("Only admins can set report status.");
+    if (req.user.role !== "ADMIN" && (creating || body.status !== "CLOSED")) {
+      const error = new Error("You can only close your own report. Other status changes require an admin.");
       error.statusCode = 403;
       throw error;
     }
@@ -173,7 +197,10 @@ export function validateReport(req, res, next) {
 
 export function validateReportQuery(req, res, next) {
   const query = req.query;
-  const allowedFields = ["page", "limit", "type", "status", "categoryId", "locationId"];
+  const allowedFields = [
+    "page", "limit", "type", "status", "categoryId", "locationId",
+    "category", "location", "dateFrom", "dateTo", "q",
+  ];
   for (const field of Object.keys(query)) {
     if (!allowedFields.includes(field)) {
       const error = new Error(`Unknown query parameter: ${field}.`);
@@ -191,21 +218,21 @@ export function validateReportQuery(req, res, next) {
       throw error;
     }
   }
-  // Prisma's pagination values must fit within a 32-bit integer.
+  // Keep the page size and offset within a sensible range.
   if (Number(limit) > 100 || (Number(page) - 1) * Number(limit) > 2147483647) {
     const error = new Error("limit must be at most 100 and page must be within range.");
     error.statusCode = 400;
     throw error;
   }
 
-  const where = {};
+  const filters = {};
   if (query.type !== undefined) {
     if (!["LOST", "FOUND"].includes(query.type)) {
       const error = new Error("type must be LOST or FOUND.");
       error.statusCode = 400;
       throw error;
     }
-    where.type = query.type;
+    filters.type = query.type;
   }
   if (query.status !== undefined) {
     if (!reportStatuses.includes(query.status)) {
@@ -213,14 +240,33 @@ export function validateReportQuery(req, res, next) {
       error.statusCode = 400;
       throw error;
     }
-    where.status = query.status;
+    filters.status = query.status;
   }
   for (const field of ["categoryId", "locationId"]) {
     if (query[field] !== undefined) {
       checkId(query[field], field);
-      where[field] = query[field];
+      filters[field] = query[field];
     }
   }
-  req.reportQuery = { page: Number(page), limit: Number(limit), where };
+  for (const field of ["category", "location"]) {
+    checkConflictingFields(query, field, `${field}Id`);
+    if (query[field] !== undefined) {
+      filters[field] = readString(query, field, 100);
+    }
+  }
+  if (query.q !== undefined) {
+    filters.q = readString(query, "q", 200);
+  }
+  for (const field of ["dateFrom", "dateTo"]) {
+    if (query[field] !== undefined) {
+      filters[field] = readDate(query[field], field, true);
+    }
+  }
+  if (filters.dateFrom && filters.dateTo && filters.dateFrom > filters.dateTo) {
+    const error = new Error("dateFrom must be on or before dateTo.");
+    error.statusCode = 400;
+    throw error;
+  }
+  req.reportQuery = { page: Number(page), limit: Number(limit), filters };
   next();
 }

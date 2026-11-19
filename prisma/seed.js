@@ -23,6 +23,7 @@ async function main() {
 
     // 2. Campus locations
     const locations = [
+        "Library",
         "A Block",
         "B Block",
         "C Block",
