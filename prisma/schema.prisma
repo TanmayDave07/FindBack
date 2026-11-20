@@ -93,6 +93,21 @@ model Location {
   description String?
 
   reports ItemReport[]
+  nearbyLocations NearbyLocation[] @relation("NearbyFrom")
+  nearbyTo        NearbyLocation[] @relation("NearbyTo")
+}
+
+// Add a pair only after confirming that the two campus locations are nearby.
+// Matching checks the pair in both directions.
+model NearbyLocation {
+  locationId       String
+  nearbyLocationId String
+
+  location       Location @relation("NearbyFrom", fields: [locationId], references: [id], onDelete: Cascade)
+  nearbyLocation Location @relation("NearbyTo", fields: [nearbyLocationId], references: [id], onDelete: Cascade)
+
+  @@id([locationId, nearbyLocationId])
+  @@index([nearbyLocationId])
 }
 
 // ==========================================
