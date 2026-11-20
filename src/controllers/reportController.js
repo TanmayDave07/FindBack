@@ -1,5 +1,6 @@
 import prisma from "../config/db.js";
 import { Prisma } from "@prisma/client";
+import { lockMatching, refreshMatches, MATCHING_FIELDS } from "../services/matching.js";
 
 const reportDetails = {
   category: true,
@@ -7,17 +8,17 @@ const reportDetails = {
   user: { select: { id: true, name: true } },
 };
 
-async function resolveReferences(body) {
+async function resolveReferences(body, db = prisma) {
   const { category: categoryName, location: locationName, ...data } = body;
   if (categoryName !== undefined || data.categoryId) {
     let category;
     if (categoryName !== undefined) {
-      const categories = await prisma.$queryRaw`
+      const categories = await db.$queryRaw`
         SELECT "id" FROM "Category" WHERE LOWER("name") = LOWER(${categoryName})
       `;
       category = categories[0];
     } else {
-      category = await prisma.category.findUnique({ where: { id: data.categoryId } });
+      category = await db.category.findUnique({ where: { id: data.categoryId } });
     }
     if (!category) {
       const error = new Error("Category does not exist.");
@@ -29,12 +30,12 @@ async function resolveReferences(body) {
   if (locationName !== undefined || data.locationId) {
     let location;
     if (locationName !== undefined) {
-      const locations = await prisma.$queryRaw`
+      const locations = await db.$queryRaw`
         SELECT "id" FROM "Location" WHERE LOWER("name") = LOWER(${locationName})
       `;
       location = locations[0];
     } else {
-      location = await prisma.location.findUnique({ where: { id: data.locationId } });
+      location = await db.location.findUnique({ where: { id: data.locationId } });
     }
     if (!location) {
       const error = new Error("Location does not exist.");
@@ -46,8 +47,8 @@ async function resolveReferences(body) {
   return data;
 }
 
-async function findReport(id) {
-  const report = await prisma.itemReport.findUnique({
+async function findReport(id, db = prisma) {
+  const report = await db.itemReport.findUnique({
     where: { id },
     include: reportDetails,
   });
@@ -143,49 +144,106 @@ export async function getReport(req, res) {
 }
 
 export async function createReport(req, res) {
-  const data = await resolveReferences(req.body);
-  const report = await prisma.itemReport.create({
-    data: { ...data, userId: req.user.id },
-    include: reportDetails,
-  });
+  const report = await prisma.$transaction(async (db) => {
+    await lockMatching(db);
+    const data = await resolveReferences(req.body, db);
+    const created = await db.itemReport.create({
+      data: { ...data, userId: req.user.id },
+      include: reportDetails,
+    });
+    await refreshMatches(db, created);
+    return created;
+  }, { maxWait: 10000, timeout: 30000 });
   res.status(201).json({ report: visibleReport(report, req.user) });
 }
 
 export async function updateReport(req, res) {
-  const existingReport = await findReport(req.params.id);
-  checkOwner(req.user, existingReport);
-  const data = await resolveReferences(req.body);
-  const report = await prisma.itemReport.update({
-    where: { id: req.params.id },
-    data,
-    include: reportDetails,
-  });
+  const report = await prisma.$transaction(async (db) => {
+    await lockMatching(db);
+    const existingReport = await findReport(req.params.id, db);
+    checkOwner(req.user, existingReport);
+    const data = await resolveReferences(req.body, db);
+    const updated = await db.itemReport.update({
+      where: { id: req.params.id },
+      data,
+      include: reportDetails,
+    });
+    if (MATCHING_FIELDS.some((field) => field in data)) {
+      await refreshMatches(db, updated);
+    }
+    return updated;
+  }, { maxWait: 10000, timeout: 30000 });
   res.json({ report: visibleReport(report, req.user) });
 }
 
 export async function closeReport(req, res) {
-  const existingReport = await findReport(req.params.id);
-  checkOwner(req.user, existingReport);
-  const report = await prisma.itemReport.update({
-    where: { id: req.params.id },
-    data: { status: "CLOSED" },
-    include: reportDetails,
-  });
+  const report = await prisma.$transaction(async (db) => {
+    await lockMatching(db);
+    const existingReport = await findReport(req.params.id, db);
+    checkOwner(req.user, existingReport);
+    const closed = await db.itemReport.update({
+      where: { id: req.params.id },
+      data: { status: "CLOSED" },
+      include: reportDetails,
+    });
+    await refreshMatches(db, closed);
+    return closed;
+  }, { maxWait: 10000, timeout: 30000 });
   res.json({ report: visibleReport(report, req.user) });
 }
 
 export async function deleteReport(req, res) {
+  await prisma.$transaction(async (db) => {
+    await lockMatching(db);
+    const report = await findReport(req.params.id, db);
+    checkOwner(req.user, report);
+    const claim = await db.claim.findFirst({
+      where: { foundReportId: report.id },
+      select: { id: true },
+    });
+    if (claim) {
+      const error = new Error("This record is linked to other records.");
+      error.statusCode = 409;
+      throw error;
+    }
+    // The existing foreign keys remove this report's match rows too.
+    await db.itemReport.delete({ where: { id: req.params.id } });
+  }, { maxWait: 10000, timeout: 30000 });
+  res.status(204).send();
+}
+
+export async function getReportMatches(req, res) {
   const report = await findReport(req.params.id);
-  checkOwner(req.user, report);
-  const claim = await prisma.claim.findFirst({
-    where: { foundReportId: report.id },
-    select: { id: true },
-  });
-  if (claim) {
-    const error = new Error("This record is linked to other records.");
-    error.statusCode = 409;
+  if (req.user.role !== "ADMIN" && report.userId !== req.user.id) {
+    const error = new Error("You can only view matches for your own reports.");
+    error.statusCode = 403;
     throw error;
   }
-  await prisma.itemReport.delete({ where: { id: req.params.id } });
-  res.status(204).send();
+  const { page, limit } = req.reportQuery;
+  const where = {
+    OR: [{ lostReportId: report.id }, { foundReportId: report.id }],
+    status: "PENDING",
+    lostReport: { type: "LOST", status: "ACTIVE" },
+    foundReport: { type: "FOUND", status: "ACTIVE" },
+  };
+  const [rows, total] = await prisma.$transaction([
+    prisma.match.findMany({
+      where,
+      include: {
+        lostReport: { include: reportDetails },
+        foundReport: { include: reportDetails },
+      },
+      orderBy: [{ score: "desc" }, { id: "asc" }],
+      skip: (page - 1) * limit,
+      take: limit,
+    }),
+    prisma.match.count({ where }),
+  ]);
+  const matches = rows.map((match) => ({
+    id: match.id,
+    score: match.score,
+    status: match.status,
+    report: visibleReport(report.type === "LOST" ? match.foundReport : match.lostReport, req.user),
+  }));
+  res.json({ matches, page, limit, total });
 }

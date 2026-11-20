@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { after, afterEach, before, describe, it } from "node:test";
 import { randomBytes, randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 
@@ -13,6 +15,7 @@ const categories = {};
 const locations = {};
 const createdCategoryIds = [];
 const createdLocationIds = [];
+const createdNearbyPairs = [];
 
 function lostReport(changes = {}) {
   return {
@@ -51,6 +54,18 @@ async function listReports(query = "", actor = "owner") {
   const response = await request("GET", `/api/reports${query ? `?${query}` : ""}`, undefined, actor);
   assert.equal(response.status, 200, JSON.stringify(response.data));
   return response.data;
+}
+
+async function getMatches(reportId, actor = "owner", query = "") {
+  const response = await request("GET", `/api/reports/${reportId}/matches${query ? `?${query}` : ""}`, undefined, actor);
+  assert.equal(response.status, 200, JSON.stringify(response.data));
+  return response.data;
+}
+
+async function createMatchingPair() {
+  const lost = await createReport({ date: undefined, eventDate: "2026-11-10T14:00:00Z" });
+  const found = await createReport({ type: "FOUND", date: undefined, eventDate: "2026-11-10T14:30:00Z" }, "other");
+  return { lost, found };
 }
 
 describe("Lost and found reporting", { concurrency: false }, () => {
@@ -114,10 +129,17 @@ describe("Lost and found reporting", { concurrency: false }, () => {
 
   afterEach(async () => {
     if (!prisma || !Object.keys(users).length) return;
+    await prisma.claim.deleteMany({
+      where: { userId: { in: Object.values(users).map((user) => user.id) } },
+    });
     // These users were created by this suite, so only their reports are removed.
     await prisma.itemReport.deleteMany({
       where: { userId: { in: Object.values(users).map((user) => user.id) } },
     });
+    for (const pair of createdNearbyPairs) {
+      await prisma.nearbyLocation.deleteMany({ where: pair });
+    }
+    createdNearbyPairs.length = 0;
   });
 
   after(async () => {
@@ -355,5 +377,197 @@ describe("Lost and found reporting", { concurrency: false }, () => {
     assert.equal(list.total, 0);
     assert.equal((await listReports()).total, 1);
     assert.equal((await request("GET", `/api/reports/${report.id}`)).status, 200);
+  });
+
+  it("automatically stores a match and shows it to both report owners", async () => {
+    const { lost, found } = await createMatchingPair();
+    const matches = await getMatches(lost.id);
+    assert.equal(matches.total, 1);
+    assert.equal(matches.matches[0].score, 100);
+    assert.equal(matches.matches[0].report.id, found.id);
+    assert.equal(matches.matches[0].report.category.name, "Wallet");
+    const reverse = await getMatches(found.id, "other");
+    assert.equal(reverse.matches[0].id, matches.matches[0].id);
+    assert.equal(reverse.matches[0].report.id, lost.id);
+    const stored = await prisma.match.findUnique({ where: { id: matches.matches[0].id } });
+    assert.equal(stored.lostReportId, lost.id);
+    assert.equal(stored.foundReportId, found.id);
+    assert.equal(stored.status, "PENDING");
+  });
+
+  it("also matches when the found report is created first", async () => {
+    const found = await createReport({ type: "FOUND" }, "other");
+    const lost = await createReport();
+    const matches = await getMatches(lost.id);
+    assert.equal(matches.total, 1);
+    assert.equal(matches.matches[0].report.id, found.id);
+    assert.equal(await prisma.match.count(), 1);
+  });
+
+  it("excludes same-type, different-category and ineligible reports", async () => {
+    const lost = await createReport();
+    await createReport();
+    await createReport({ type: "FOUND", category: "Phone" });
+    for (const status of ["CLOSED", "RESOLVED", "MATCHED"]) {
+      const found = await createReport({ type: "FOUND" });
+      assert.equal((await request("PATCH", `/api/reports/${found.id}`, { status }, "admin")).status, 200);
+    }
+    const active = await createReport({ type: "FOUND" });
+    const matches = await getMatches(lost.id);
+    assert.equal(matches.total, 1);
+    assert.equal(matches.matches[0].report.id, active.id);
+    const rows = await prisma.match.findMany({ include: { lostReport: true, foundReport: true } });
+    for (const row of rows) {
+      assert.equal(row.lostReport.type, "LOST");
+      assert.equal(row.foundReport.type, "FOUND");
+      assert.equal(row.lostReport.categoryId, row.foundReport.categoryId);
+    }
+  });
+
+  it("ranks matches by score, applies the cutoff and paginates with an accurate total", async () => {
+    const lost = await createReport({ date: undefined, eventDate: "2026-11-10T14:00:00Z" });
+    await createReport({ type: "FOUND", date: undefined, eventDate: "2026-11-10T14:30:00Z" });
+    await createReport({ type: "FOUND", date: undefined, eventDate: "2026-11-10T14:30:00Z", description: "Black wallet" });
+    await createReport({ type: "FOUND", date: undefined, eventDate: "2026-11-10T14:30:00Z", location: "Main Ground" });
+    await createReport({ type: "FOUND", date: undefined, eventDate: "2026-11-10T14:30:00Z", location: "Main Ground", color: null, description: "Different item" });
+    await createReport({ type: "FOUND", date: "2026-10-01", location: "Main Ground", color: "White", description: "Different item" });
+    const first = await getMatches(lost.id, "owner", "page=1&limit=2");
+    const second = await getMatches(lost.id, "owner", "page=2&limit=2");
+    assert.equal(first.total, 4);
+    assert.equal(second.total, 4);
+    assert.deepEqual([...first.matches, ...second.matches].map((match) => match.score), [100, 95, 75, 50]);
+    assert.equal((await getMatches(lost.id, "owner", "page=3&limit=2")).matches.length, 0);
+  });
+
+  it("awards nearby-location points from a manually stored pair in both directions", async () => {
+    const pair = { locationId: locations.Library.id, nearbyLocationId: locations["Main Ground"].id };
+    await prisma.nearbyLocation.create({ data: pair });
+    createdNearbyPairs.push(pair);
+    const lost = await createReport();
+    const found = await createReport({ type: "FOUND", location: "Main Ground" });
+    assert.equal((await getMatches(lost.id)).matches[0].score, 90);
+    const otherLost = await createReport({ location: "Main Ground" });
+    const otherFound = await createReport({ type: "FOUND" });
+    const matches = await getMatches(otherLost.id);
+    assert.equal(matches.matches.find((match) => match.report.id === otherFound.id).score, 90);
+    assert.equal((await getMatches(found.id)).total, 2);
+  });
+
+  it("recalculates relevant edits, invalidates stale pairs and reuses their stored IDs", async () => {
+    const { lost, found } = await createMatchingPair();
+    const original = (await getMatches(lost.id)).matches[0];
+    for (const [changes, score] of [
+      [{ color: "White" }, 90],
+      [{ color: "Black", description: "Different item" }, 85],
+      [{ description: "Black leather wallet", eventDate: "2026-11-18T14:00:00Z" }, 80],
+      [{ eventDate: "2026-11-10T14:30:00Z", location: "Main Ground" }, 75],
+    ]) {
+      assert.equal((await request("PATCH", `/api/reports/${found.id}`, changes, "other")).status, 200);
+      const matches = await getMatches(lost.id);
+      assert.equal(matches.matches[0].score, score);
+      assert.equal(matches.matches[0].id, original.id);
+    }
+    for (const changes of [{ category: "Phone" }, { category: "Wallet", type: "LOST" }]) {
+      assert.equal((await request("PATCH", `/api/reports/${found.id}`, changes, "other")).status, 200);
+      assert.equal((await getMatches(lost.id)).total, 0);
+      assert.equal((await prisma.match.findUnique({ where: { id: original.id } })).status, "INVALIDATED");
+    }
+    await request("PATCH", `/api/reports/${found.id}`, { type: "FOUND", location: "Library" }, "other");
+    assert.equal((await getMatches(lost.id)).matches[0].id, original.id);
+    assert.equal((await getMatches(lost.id)).matches[0].score, 100);
+    assert.equal(await prisma.match.count(), 1);
+  });
+
+  it("invalidates matches when either report closes or becomes resolved or matched", async () => {
+    const { lost, found } = await createMatchingPair();
+    const originalId = (await getMatches(lost.id)).matches[0].id;
+    for (const report of [lost, found]) {
+      for (const status of ["CLOSED", "RESOLVED", "MATCHED"]) {
+        assert.equal((await request("PATCH", `/api/reports/${report.id}`, { status }, "admin")).status, 200);
+        assert.equal((await getMatches(lost.id)).total, 0);
+        assert.equal((await getMatches(found.id, "other")).total, 0);
+        assert.equal((await prisma.match.findUnique({ where: { id: originalId } })).status, "INVALIDATED");
+        await request("PATCH", `/api/reports/${report.id}`, { status: "ACTIVE" }, "admin");
+        assert.equal((await getMatches(lost.id)).matches[0].id, originalId);
+      }
+    }
+    assert.equal((await request("POST", `/api/reports/${lost.id}/close`, {})).status, 200);
+    assert.equal((await getMatches(found.id, "other")).total, 0);
+  });
+
+  it("keeps private details out of suggestions and does not rescore private-only edits", async () => {
+    const { lost, found } = await createMatchingPair();
+    const matchId = (await getMatches(lost.id)).matches[0].id;
+    const before = await prisma.match.findUnique({ where: { id: matchId } });
+    await request("PATCH", `/api/reports/${found.id}`, { privateDetails: "Private serial number" }, "other");
+    const matches = await getMatches(lost.id);
+    assert.equal("privateDetails" in matches.matches[0].report, false);
+    assert.equal(matches.matches[0].score, 100);
+    const after = await prisma.match.findUnique({ where: { id: matchId } });
+    assert.equal(after.updatedAt.getTime(), before.updatedAt.getTime());
+    assert.equal((await getMatches(lost.id, "admin")).matches[0].report.privateDetails, "Private serial number");
+    assert.equal((await request("GET", `/api/reports/${lost.id}/matches`, undefined, "other")).status, 403);
+    assert.equal((await request("GET", `/api/reports/${lost.id}/matches`, undefined, null)).status, 401);
+    for (const query of ["q=wallet", "page=0", "limit=101", "page=1&page=2"]) {
+      assert.equal((await request("GET", `/api/reports/${lost.id}/matches?${query}`)).status, 400);
+    }
+  });
+
+  it("preserves rejected and confirmed decisions and keeps claim references when invalidating", async () => {
+    const { lost, found } = await createMatchingPair();
+    const matchId = (await getMatches(lost.id)).matches[0].id;
+    await prisma.match.update({ where: { id: matchId }, data: { status: "DISMISSED" } });
+    await request("PATCH", `/api/reports/${found.id}`, { color: "White" }, "other");
+    assert.equal((await getMatches(lost.id)).total, 0);
+    assert.equal((await prisma.match.findUnique({ where: { id: matchId } })).status, "DISMISSED");
+    await prisma.match.update({ where: { id: matchId }, data: { status: "CONFIRMED" } });
+    await request("PATCH", `/api/reports/${found.id}`, { color: "Black" }, "other");
+    assert.equal((await prisma.match.findUnique({ where: { id: matchId } })).status, "CONFIRMED");
+    const claim = await prisma.claim.create({ data: {
+      userId: users.owner.id, foundReportId: found.id, matchId, message: "This is my wallet",
+    } });
+    await request("POST", `/api/reports/${found.id}/close`, {}, "other");
+    assert.equal((await prisma.match.findUnique({ where: { id: matchId } })).status, "INVALIDATED");
+    assert.equal((await prisma.claim.findUnique({ where: { id: claim.id } })).matchId, matchId);
+  });
+
+  it("rebuilds suggestions for existing reports and safely reruns without duplicates", async () => {
+    const data = {
+      title: "Black wallet", description: "Black leather wallet", color: "Black",
+      categoryId: categories.Wallet.id, locationId: locations.Library.id,
+      eventDate: new Date("2026-11-10T14:00:00Z"),
+    };
+    const lost = await prisma.itemReport.create({ data: { ...data, userId: users.owner.id, type: "LOST" } });
+    await prisma.itemReport.create({ data: { ...data, userId: users.other.id, type: "FOUND" } });
+    assert.equal((await getMatches(lost.id)).total, 0);
+    const run = promisify(execFile);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await run(process.execPath, ["scripts/rebuildMatches.js"], { cwd: new URL("../", import.meta.url) });
+      assert.match(result.stdout, /1 potential matches stored/);
+      assert.equal((await getMatches(lost.id)).total, 1);
+      assert.equal(await prisma.match.count(), 1);
+    }
+  });
+
+  it("handles simultaneous lost/found submissions and a concurrent close safely", async () => {
+    const [lost, found] = await Promise.all([
+      createReport(), createReport({ type: "FOUND" }, "other"),
+    ]);
+    assert.equal((await getMatches(lost.id)).total, 1);
+    assert.equal(await prisma.match.count(), 1);
+    await Promise.all([
+      request("POST", `/api/reports/${lost.id}/close`, {}),
+      createReport({ type: "FOUND" }, "other"),
+    ]);
+    assert.equal((await getMatches(found.id, "other")).total, 0);
+    assert.equal(await prisma.match.count({ where: { status: "PENDING" } }), 0);
+  });
+
+  it("removes match rows when their report is deleted", async () => {
+    const { lost, found } = await createMatchingPair();
+    assert.equal(await prisma.match.count(), 1);
+    assert.equal((await request("DELETE", `/api/reports/${found.id}`, undefined, "other")).status, 204);
+    assert.equal((await getMatches(lost.id)).total, 0);
+    assert.equal(await prisma.match.count(), 0);
   });
 });

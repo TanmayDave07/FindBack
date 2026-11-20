@@ -270,3 +270,14 @@ export function validateReportQuery(req, res, next) {
   req.reportQuery = { page: Number(page), limit: Number(limit), filters };
   next();
 }
+
+export function validateMatchQuery(req, res, next) {
+  for (const field of Object.keys(req.query)) {
+    if (!["page", "limit"].includes(field)) {
+      const error = new Error(`Unknown query parameter: ${field}.`);
+      error.statusCode = 400;
+      throw error;
+    }
+  }
+  validateReportQuery(req, res, next);
+}

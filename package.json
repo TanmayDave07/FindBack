@@ -21,10 +21,11 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
-    "test": "node --test tests/*.test.js",
+    "test": "node --test --test-concurrency=1 tests/*.test.js",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate deploy",
     "db:seed": "prisma db seed",
+    "matches:rebuild": "node scripts/rebuildMatches.js",
     "create-admin": "node scripts/createAdmin.js"
   },
   "devDependencies": {

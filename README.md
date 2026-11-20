@@ -97,6 +97,7 @@ Admins use the same login endpoint as students.
 | GET | `/api/locations` | Logged-in user |
 | GET | `/api/reports` | Logged-in user |
 | GET | `/api/reports/:id` | Logged-in user |
+| GET | `/api/reports/:id/matches` | Report owner or admin |
 | POST | `/api/reports` | Logged-in user |
 | PATCH | `/api/reports/:id` | Report owner or admin |
 | POST | `/api/reports/:id/close` | Report owner or admin |
@@ -222,7 +223,8 @@ is sufficient for this MVP; no special search engine or advanced SQL is used.
 
 The tests use Node's built-in test runner and a separate PostgreSQL database.
 They check both report types, ownership, closing, private details, filters,
-pagination, invalid inputs, and SQL-looking search text.
+pagination, invalid inputs, SQL-looking search text, matching scores, ranking,
+automatic recalculation, and simultaneous submissions.
 
 Create a local test database, apply migrations to it, and run:
 
@@ -245,6 +247,76 @@ Invalid input returns `400`, missing records return `404`, and duplicates or
 linked-record conflicts return `409`. Unexpected failures return `500` without
 exposing database details.
 
+## Automatic matching
+
+Creating a report automatically searches for potential matches. Editing its
+category, location, date/time, color, description, type, or status updates its
+matches too. The scoring rules and examples are explained in
+[the matching algorithm guide](docs/matching-algorithm.md).
+
+Only `ACTIVE` reports of opposite types in the same category are candidates.
+Reports marked `CLOSED`, `RESOLVED` (returned), or `MATCHED` are excluded.
+Private details are never used for scoring. A private-details-only edit does
+not recalculate the score.
+
+Get ranked suggestions for your report:
+
+```text
+GET /api/reports/REPORT_UUID/matches?page=1&limit=20
+```
+
+The report owner or an admin can view this list. It works for both lost and
+found reports. The highest score comes first; equal scores use the match ID
+to keep pagination stable. The default page size is 20 and the maximum is 100.
+
+```json
+{
+  "matches": [
+    {
+      "id": "MATCH_UUID",
+      "score": 95,
+      "status": "PENDING",
+      "report": {
+        "id": "FOUND_REPORT_UUID",
+        "type": "FOUND",
+        "title": "Black wallet"
+      }
+    }
+  ],
+  "page": 1,
+  "limit": 20,
+  "total": 1
+}
+```
+
+`report` contains the counterpart's normal public report fields, category,
+location, and owner name. Private details are included only if the requester
+owns that counterpart too, or is an admin. A score describes how closely the
+two reports agree on the five weighted rules.
+
+Results are stored in the existing `Match` table. Its unique constraint on
+`lostReportId` and `foundReportId` prevents duplicate pairs. Recalculation
+updates the same row and preserves its ID. Stale pairs become `INVALIDATED`
+and leave the suggestions list, while their history and claim references stay
+in the database. Reopening a report recalculates eligible suggestions.
+Existing `DISMISSED` decisions stay dismissed; still-valid `CONFIRMED`
+decisions stay confirmed. Only current `PENDING` suggestions appear in the list.
+
+Each report change and its matching updates run in one database transaction.
+A short SQL table lock queues report changes so simultaneous submissions see
+each other. Deleting a report also removes its match rows through the existing
+foreign keys.
+
+To generate suggestions for reports that existed before this feature, or
+after changing weights or nearby-location pairs, run:
+
+```bash
+npm run matches:rebuild
+```
+
+The rebuild can be run again without creating duplicate pairs. Apply all
+migrations before running the updated server.
+
 ## Code structure
 
 ```text
@@ -255,8 +327,10 @@ src/
   routes/         API endpoints and their middleware
   controllers/    Registration, login, reports, and lookups
   middleware/     Authentication, validation, and error handling
+  services/       Matching scores, candidate search, and match storage
 scripts/
   createAdmin.js  Create an admin from local environment settings
+  rebuildMatches.js  Recalculate matches for existing reports
 ```
 
 Express 5 handles rejected async handlers, so controllers can throw errors
