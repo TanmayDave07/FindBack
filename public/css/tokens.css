@@ -1,0 +1,12 @@
+:root {
+  --p-bg: #f7f7f5; --p-surface: #ebebe8; --p-ink: #000000; --p-muted: #666662;
+  --p-accent: #d0106f; --p-accent-ink: #ffffff; --p-action: #d0106f; --p-action-ink: #ffffff;
+  --p-inv-bg: #000000; --p-inv-surface: #010101; --p-inv-ink: #f7f7f5; --p-inv-muted: #828280;
+  --p-inv-accent: #d0106f; --p-inv-accent-ink: #ffffff; --p-inv-action: #d0106f; --p-inv-action-ink: #ffffff;
+  --font-display: "Geist", system-ui, sans-serif;
+  --font-text: "Geist", system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --display-weight: 500;
+  --display-tracking: -0.035em;
+  --display-tracking-xl: -0.045em;
+}
