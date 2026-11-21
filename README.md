@@ -317,6 +317,47 @@ npm run matches:rebuild
 The rebuild can be run again without creating duplicate pairs. Apply all
 migrations before running the updated server.
 
+## Frontend
+
+Run `npm start`, then open `http://localhost:3000` (or the `PORT` set in `.env`).
+The same Express server serves the frontend and API, so no separate frontend
+server, build step, or new runtime dependencies are needed.
+
+| Screen | What it does |
+| --- | --- |
+| Login / Register | Authenticate with the existing account endpoints |
+| Dashboard | Show actual campus counts and recent reports |
+| Report Lost / Report Found | Submit details through the existing reporting API |
+| Browse Items | Search, filter, paginate, and read item details |
+| My Reports | Edit, close, delete, and view matches for your reports |
+| Potential Matches | Select your report and compare ranked counterparts and scores |
+| Manage Platform | Administrators can view members, edit reports, and update statuses |
+
+The frontend uses plain HTML, CSS, and JavaScript modules in `public/`.
+Authentication is stored in session storage for the browser tab; signing out
+clears it. Page loads check the current account through `/api/auth/me`.
+Private identifying details are handled by the existing API permissions.
+Report photos use the optional photo URL; reports without a photo show their
+category glyph. No report data or activity counts are fabricated in the app.
+
+Claim submission is explicitly **Coming soon**. The frontend displays its
+disabled button on applicable lost-item matches and adds no claim or
+verification endpoints.
+
+For reproducible browser checks, create an empty local test database, apply
+migrations to it, then run:
+
+```bash
+TEST_DATABASE_URL="postgresql://localhost:5432/findback_ui_test" npm run frontend:qa
+```
+
+The local QA server runs on `127.0.0.1:3188` with separate test records.
+`/?flow=student#/register` exercises registration, login, reporting, browsing,
+editing, closing, matches, privacy, and a page reload.
+`/?account=admin&flow=admin#/admin` checks administrator controls.
+These routes exist only in the QA server, never in `npm start`.
+Results are written under `.taste-skill/`, which is ignored by Git.
+
 ## Code structure
 
 ```text
@@ -331,6 +372,11 @@ src/
 scripts/
   createAdmin.js  Create an admin from local environment settings
   rebuildMatches.js  Recalculate matches for existing reports
+public/
+  index.html        Frontend entry point
+  css/              Shared responsive styling and local font declarations
+  js/               API/session helpers, routing, and page modules
+  assets/           Fonts and the provided hover/press motion layer
 ```
 
 Express 5 handles rejected async handlers, so controllers can throw errors

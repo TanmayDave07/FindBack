@@ -8,3 +8,7 @@ node_modules/
 
 # Build output
 dist/
+
+# Local visual checks and macOS metadata
+.taste-skill/
+.DS_Store
